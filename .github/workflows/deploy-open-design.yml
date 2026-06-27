@@ -1,0 +1,127 @@
+# Open Design image — build & publish to GHCR (Lothal stack U.2).
+#
+# Mirrors realbytecode/langflow's deploy-lothal.yml *build* recipe, but only the
+# build+push half: this repo PUBLISHES the pinned OD image; the Lothal stack's
+# deploy-lothal.yml CONSUMES it (OD is a service in docker-compose.prod.yml, so
+# the existing `docker compose pull && up -d` brings it up — no build job there).
+#
+# Manual dispatch. Builds deploy/Dockerfile and pushes:
+#   ghcr.io/realbytecode/open-design:<short-sha>   (always — the prod-pinnable ref)
+#   ghcr.io/realbytecode/open-design:v<version>     (when `version` is given)
+#   ghcr.io/realbytecode/open-design:latest         (convenience; never pin this in prod)
+#
+# GHCR push uses the built-in GITHUB_TOKEN (packages: write) — no PAT. The image
+# is private by default; the Lothal box already `docker login ghcr.io` during
+# deploy-lothal.yml, so the same credentials pull it.
+#
+# Single linux/amd64 build: the RackNerd box (107.172.168.104 / lothal.app) is
+# x86_64 and ubuntu-latest runners are amd64 — no QEMU, no multi-arch manifest.
+# The upstream multi-arch path stays in docker-image.yml, untouched.
+name: Build Open Design image
+run-name: Build OD image from ${{ inputs.ref }} by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to build."
+        required: true
+        type: string
+        default: dev
+      version:
+        description: "Optional version (e.g. 0.11.1) — also tags :v0.11.1. Blank = SHA + :latest only."
+        required: false
+        type: string
+        default: ""
+      push_to_registry:
+        description: "Push to GHCR. Uncheck to test the build without publishing."
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-open-design
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: realbytecode/open-design
+
+jobs:
+  build-and-push:
+    name: Build & push OD image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out ${{ inputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Compute image refs
+        id: refs
+        env:
+          # Pass the dispatch input through env, never interpolate it directly
+          # into the shell body (template injection). Validated below before use.
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          sha="$(git rev-parse --short=12 HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "sha_image=${REGISTRY}/${IMAGE_NAME}:${sha}" >> "$GITHUB_OUTPUT"
+          echo "latest_image=${REGISTRY}/${IMAGE_NAME}:latest" >> "$GITHUB_OUTPUT"
+          echo "Building from $(git rev-parse HEAD) -> sha tag ${sha}"
+
+          version_in="${VERSION_INPUT}"
+          if [ -n "$version_in" ] && ! printf '%s' "$version_in" | grep -Eq '^v?[0-9]+(\.[0-9]+)*$'; then
+            echo "::error::Invalid version '$version_in'. Expected forms like 0.11.1 or v0.11.1"
+            exit 1
+          fi
+          bare="${version_in#v}"
+          if [ -n "$version_in" ]; then
+            echo "version_image=${REGISTRY}/${IMAGE_NAME}:v${bare}" >> "$GITHUB_OUTPUT"
+            echo "Also tagging :v${bare}"
+          else
+            echo "version_image=" >> "$GITHUB_OUTPUT"
+            echo "No version given -> SHA + :latest only"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: ${{ inputs.push_to_registry }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: ${{ inputs.push_to_registry }}
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ${{ steps.refs.outputs.sha_image }}
+            ${{ steps.refs.outputs.version_image }}
+            ${{ steps.refs.outputs.latest_image }}
+          cache-from: type=gha,scope=open-design
+          cache-to: type=gha,mode=max,scope=open-design
+
+      - name: Summary
+        if: ${{ inputs.push_to_registry }}
+        run: |
+          {
+            echo "### Open Design image published"
+            echo ""
+            echo "Pin this in the Lothal stack's \`/opt/lothal/.env\` as \`OD_IMAGE\`:"
+            echo ""
+            echo '```'
+            echo "OD_IMAGE=${{ steps.refs.outputs.sha_image }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
