@@ -103,6 +103,20 @@ COPY --from=build --chown=open-design:open-design /app/plugins/_official ./plugi
 RUN mkdir -p /app/.od && \
     chown -R open-design:open-design /app
 
+# Bake the Claude Code agent CLI into the image so OD detects an available agent
+# out of the box (runtimes/defs/claude.ts looks for `claude` on PATH). Lothal
+# drives this agent and points it at its LLM gateway via agentCliEnv at run time;
+# without a baked-in binary OD starts with zero available agents and can't
+# generate. Installed globally as root (→ /usr/local/bin/claude, on PATH) before
+# dropping to the unprivileged user. npm 11's allow-scripts gate skips the
+# package's postinstall, so run it explicitly (it copies the per-arch native
+# binary over the wrapper stub — correct for each platform of the multi-arch
+# build); the wrapper is a working fallback if it can't, so it's non-fatal.
+# `claude --version` is the hard gate — it fails the build if the CLI can't run.
+RUN npm install -g @anthropic-ai/claude-code && \
+    (node "$(npm root -g)/@anthropic-ai/claude-code/install.cjs" || true) && \
+    claude --version
+
 ENV NODE_ENV=production
 ENV NODE_OPTIONS=--max-old-space-size=192
 ENV OD_BIND_HOST=0.0.0.0
